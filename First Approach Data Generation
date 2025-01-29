@@ -1,0 +1,500 @@
+
+import os
+import pickle
+import numpy as np
+import math
+import gc 
+
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import MinMaxScaler
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
+from filterpy.kalman import KalmanFilter
+
+from bayes_opt import BayesianOptimization
+
+GLOBAL_TRACK_DISTANCES = {}
+KEYPOINTS_MEDIAN_GLOBAL = None
+
+def remove_null_placeholders_after_shift(frame, new_origin, threshold=0.01):
+
+    return frame[np.linalg.norm(frame - new_origin, axis=1) > threshold]
+
+def split_data_into_frames(stacked_data, n_frames=5):
+    
+    frames = []
+    total_points = len(stacked_data)
+    frame_size = total_points // n_frames
+
+    start_idx = 0
+    for i in range(n_frames):
+        end_idx = start_idx + frame_size
+        if i == n_frames - 1:
+            frames.append(stacked_data[start_idx:])
+        else:
+            frames.append(stacked_data[start_idx:end_idx])
+        start_idx = end_idx
+    return frames
+
+def apply_dbscan(points, eps=0.4, min_samples=4, xy_weight=1.0, z_weight=0.25):
+    
+    if points.shape[0] == 0:  
+        return np.array([], dtype=np.int16)  
+
+    weighted_data = points.astype(np.float32)  
+    weighted_data[:, :2] *= xy_weight
+    weighted_data[:, 2] *= z_weight
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(weighted_data)
+    return clustering.labels_.astype(np.int16)  
+
+def calculate_centroids(frame, labels):
+    centroids = {}
+    unique_labels = np.unique(labels)
+    for lbl in unique_labels:
+        if lbl != -1:
+            cluster_points = frame[labels == lbl]
+            centroids[lbl] = np.mean(cluster_points, axis=0)
+    return centroids
+
+def calculate_cost_matrix(centroidsA, centroidsB):
+    arrA = np.array(list(centroidsA.values()), dtype=np.float32)  # Change 3: Optimized data type
+    arrB = np.array(list(centroidsB.values()), dtype=np.float32)  # Change 3: Optimized data type
+
+    if len(arrA) == 0 or len(arrB) == 0:
+        return None, None, None
+
+    cost_matrix = cdist(arrA, arrB)
+    row_inds, col_inds = linear_sum_assignment(cost_matrix)
+
+    return cost_matrix, row_inds, col_inds
+
+def match_centroids_between_frames(centroids_t, centroids_t1, frame_index=0):
+    cost_matrix, row_inds, col_inds = calculate_cost_matrix(
+        centroids_t, centroids_t1
+    )
+    return row_inds, col_inds, cost_matrix
+
+def build_tracks_across_frames(all_centroids, all_labels, all_clean_frames):
+    n_frames = len(all_centroids)
+    frame_label_centroid_maps = []
+    for i in range(n_frames):
+        cdict = all_centroids[i]
+        sorted_labels = sorted(list(cdict.keys()))
+        label_centroid_list = [(lbl, cdict[lbl]) for lbl in sorted_labels]
+        frame_label_centroid_maps.append(label_centroid_list)
+
+    centroids_list = []
+    for i in range(n_frames):
+        arr = np.array([pair[1] for pair in frame_label_centroid_maps[i]], dtype=np.float32)  # Change 3
+        centroids_list.append(arr)
+
+    track_positions = {}
+    if len(centroids_list[0]) > 0:
+        for i in range(len(centroids_list[0])):
+            lbl_i, centroid_i = frame_label_centroid_maps[0][i]
+            points_i = all_clean_frames[0][all_labels[0] == lbl_i]
+            track_positions[i] = [{
+                'frame_idx': 0,
+                'cluster_label': lbl_i,
+                'points': points_i.astype(np.float32),  
+                'centroid': centroid_i.astype(np.float32)  
+            }]
+
+    for t in range(n_frames - 1):
+        arr_t = centroids_list[t]
+        arr_t1 = centroids_list[t+1]
+
+        if len(all_clean_frames[t+1]) != len(all_labels[t+1]):
+            continue
+
+        if len(arr_t) == 0 or len(arr_t1) == 0:
+            continue
+
+        row_inds, col_inds, _ = match_centroids_between_frames(
+            dict(frame_label_centroid_maps[t]),
+            dict(frame_label_centroid_maps[t+1]),
+            frame_index=t
+        )
+        if row_inds is None or col_inds is None:
+            continue
+
+        matched_pairs = dict(zip(row_inds, col_inds))
+        for r_idx, c_idx in matched_pairs.items():
+            lbl_t = frame_label_centroid_maps[t][r_idx][0]
+            lbl_t1 = frame_label_centroid_maps[t+1][c_idx][0]
+            centroid_t1 = frame_label_centroid_maps[t+1][c_idx][1]
+            points_t1 = all_clean_frames[t+1][all_labels[t+1] == lbl_t1].astype(np.float32)  # Change 3
+            if r_idx in track_positions:
+                track_positions[r_idx].append({
+                    'frame_idx': t+1,
+                    'cluster_label': lbl_t1,
+                    'points': points_t1,
+                    'centroid': centroid_t1.astype(np.float32)  # Change 3
+                })
+
+    tracks = {}
+    for tid, data_list in track_positions.items():
+        tracks[tid] = data_list
+    return tracks
+
+def bayesian_optimize_kalman_params(tracks, max_frames=5, init_points=5, n_iter=15):
+
+    def test_kalman_params(q_val, r_val, p_val):
+        total_error = 0.0
+        count = 0
+
+        for track_id, data_list in tracks.items():
+            if len(data_list) < 1:
+                continue
+            sorted_data = sorted(data_list, key=lambda x: x['frame_idx'])
+            centroids = [d['centroid'] for d in sorted_data]
+
+            kf = KalmanFilter(dim_x=4, dim_z=2)
+            dt = 1
+            kf.F = np.array([
+                [1, 0, dt, 0],
+                [0, 1, 0, dt],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1]
+            ], dtype=np.float32)  
+            kf.H = np.array([[1, 0, 0, 0],
+                             [0, 1, 0, 0]], dtype=np.float32)  
+            kf.Q = np.eye(4, dtype=np.float32) * float(q_val)  
+            kf.R = np.eye(2, dtype=np.float32) * float(r_val)  
+            kf.P = np.eye(4, dtype=np.float32) * float(p_val) 
+            kf.x = np.array([[centroids[0][0]],
+                             [centroids[0][1]],
+                             [0.0],
+                             [0.0]], dtype=np.float32) 
+
+            for i in range(1, min(len(centroids), max_frames)):
+                kf.predict()
+                meas = np.array([[centroids[i][0]], [centroids[i][1]]], dtype=np.float32)  
+                kf.update(meas)
+
+                pred_xy = kf.x[:2].flatten()
+                true_xy = centroids[i][:2]
+                error_xy = np.linalg.norm(pred_xy - true_xy)
+                total_error += error_xy
+                count += 1
+
+        if count == 0:
+            return 0.0
+        avg_error = total_error / count
+        return -avg_error
+
+    pbounds = {
+        'q_val': (1.0, 50.0),
+        'r_val': (0.01, 10.0),
+        'p_val': (1.0, 50.0)
+    }
+
+    optimizer = BayesianOptimization(
+        f=test_kalman_params,
+        pbounds=pbounds,
+        verbose=2,
+        random_state=42
+    )
+
+    optimizer.maximize(init_points=init_points, n_iter=n_iter)
+
+    best_params = optimizer.max
+  
+    return best_params['params']
+
+def kalman_filter_init(dim_x=4, dim_z=2, Q_val=10.0, R_val=0.01, P_val=10.0):
+    kf = KalmanFilter(dim_x=dim_x, dim_z=dim_z)
+    dt = 1
+    kf.F = np.array([
+        [1, 0, dt, 0],
+        [0, 1, 0, dt],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1]
+    ], dtype=np.float32) 
+    kf.H = np.array([
+        [1, 0, 0, 0],
+        [0, 1, 0, 0]
+    ], dtype=np.float32)  
+    kf.Q = np.eye(dim_x, dtype=np.float32) * Q_val  
+    kf.R = np.eye(dim_z, dtype=np.float32) * R_val  
+    kf.P = np.eye(dim_x, dtype=np.float32) * P_val  
+    kf.x = np.array([[0.0], [0.0], [0.0], [0.0]], dtype=np.float32)  
+    return kf
+
+def apply_kalman_filter_multi_frame_stabilize(tracks, threshold=5e-2, Q_val=10.0, R_val=0.01, P_val=10.0):
+    filtered_states = {}
+    stabilization_steps = {}
+    for track_id, data_list in tracks.items():
+        if len(data_list) < 1:
+            filtered_states[track_id] = []
+            stabilization_steps[track_id] = None
+            continue
+        sorted_data_list = sorted(data_list, key=lambda x: x['frame_idx'])
+        centroids = [d['centroid'] for d in sorted_data_list]
+
+        kf = kalman_filter_init(dim_x=4, dim_z=2, Q_val=Q_val, R_val=R_val, P_val=P_val)
+        first_pos = centroids[0]
+        kf.x[0, 0] = first_pos[0]
+        kf.x[1, 0] = first_pos[1]
+
+        track_estimates = [kf.x.flatten()]
+        stabilized_step = None
+        prev_state = kf.x.copy()
+        iteration_count = 1
+        for i in range(1, len(centroids)):
+            kf.predict()
+            meas = np.array([[centroids[i][0]], [centroids[i][1]]], dtype=np.float32) 
+            kf.update(meas)
+            current_state = kf.x.copy()
+            track_estimates.append(current_state.flatten())
+            state_change = np.linalg.norm(current_state[:2] - prev_state[:2])
+            prev_state = current_state
+            iteration_count += 1
+            if stabilized_step is None and state_change < threshold:
+                stabilized_step = i
+
+        filtered_states[track_id] = track_estimates
+        stabilization_steps[track_id] = stabilized_step
+
+    return filtered_states, stabilization_steps
+
+def evaluate_kalman_prediction_quality(tracks, filtered_states):
+    track_errors = {}
+    
+    for track_id, data_list in tracks.items():
+        if track_id not in filtered_states or len(filtered_states[track_id]) == 0:
+            continue
+
+        sorted_data = sorted(data_list, key=lambda x: x['frame_idx'])
+        states = filtered_states[track_id]
+
+        errors = []
+        for i in range(min(len(states), len(sorted_data))):
+            state_xy = states[i][0:2]
+            actual_centroid = sorted_data[i]['centroid']
+            error = np.linalg.norm(state_xy - actual_centroid[:2])
+            errors.append(error)
+
+        rmse = np.sqrt(np.mean(np.square(errors))) if errors else float('inf')
+        track_errors[track_id] = rmse
+
+    return track_errors
+
+def evaluate_tracks_and_filter_out_others(tracks, filtered_states, stabilization_steps, track_errors):
+ 
+    if not filtered_states:
+        return {}
+    
+    global KEYPOINTS_MEDIAN_GLOBAL 
+    best_rmse_id = None
+    lowest_rmse = float('inf')
+    track_rmse_values = {}
+    for track_id, rmse in track_errors.items():  
+        track_rmse_values[track_id] = rmse  
+        if rmse < lowest_rmse:
+            lowest_rmse = rmse
+            best_rmse_id = track_id
+    best_distance_id = None
+    lowest_distance = float('inf')
+    for track_id, track_data in tracks.items():
+        if len(track_data) > 0:
+            all_points = np.vstack([item['points'] for item in track_data])
+            overall_centroid = np.mean(all_points, axis=0)
+            distance = np.linalg.norm(overall_centroid[:2] - KEYPOINTS_MEDIAN_GLOBAL[:2]) if KEYPOINTS_MEDIAN_GLOBAL is not None else float('inf')
+            if distance < lowest_distance:
+                lowest_distance = distance
+                best_distance_id = track_id
+
+    best_tracks = {}
+
+    if best_rmse_id == best_distance_id and best_rmse_id is not None:
+        best_tracks[best_rmse_id] = tracks[best_rmse_id]
+    else:
+        if best_rmse_id is not None and best_distance_id is not None:
+            best_rmse_track = tracks[best_rmse_id]
+            best_distance_track = tracks[best_distance_id]
+            combined_track = best_rmse_track.copy()
+            for item in best_distance_track:
+                if not any(existing['frame_idx'] == item['frame_idx'] for existing in combined_track):
+                    combined_track.append(item)
+
+            best_tracks["combined"] = combined_track
+        else:
+            return {}
+
+    return best_tracks
+
+def pad_to_num_points(data, num_points=300):
+    current_num = data.shape[0]
+    if current_num < num_points:
+        pad_size = num_points - current_num
+        padding = np.zeros((pad_size, data.shape[1]), dtype=np.float32) 
+        padded_data = np.vstack((data, padding))
+    elif current_num > num_points:
+        padded_data = data[:num_points]
+    else:
+        padded_data = data
+    return padded_data
+
+def create_dict_datasets(train_list, val_list, test_list):
+    return {
+        'train': train_list,
+        'val': val_list,
+        'test': test_list
+    }
+
+def process_and_save_incremental(train_list, val_list, test_list, output_file='data/processed/mmr_action/mm1.pkl'):
+    
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
+    datasets = {
+        'train': train_list,
+        'val': val_list,
+        'test': test_list
+    }
+
+    with open(output_file, 'wb') as f:
+        pickle.dump(datasets, f)
+   
+    
+def main():
+    
+    batch_size = 100  
+    train_data = []
+    val_data = []
+    test_data = []
+
+    edges = [(8, 0), (8, 2), (0, 1), (2, 3), (0, 4), (2, 6), (4, 5), (6, 7)]
+
+    main_file_path = 'data/processed/mmr_action/data.pkl'
+    if not os.path.exists(main_file_path):
+        return
+    with open(main_file_path, 'rb') as f_main:
+        main_processed_data = pickle.load(f_main)
+
+    all_main_samples = main_processed_data.get('train', []) + \
+                        main_processed_data.get('val', []) + \
+                        main_processed_data.get('test', [])
+   
+    kp_file_path = 'data/processed/mmr_kp/datak.pkl'
+    if not os.path.exists(kp_file_path):
+        return
+    with open(kp_file_path, 'rb') as f_kp:
+        kp_processed_data = pickle.load(f_kp)
+    all_kp_samples = kp_processed_data.get('train', []) + \
+                     kp_processed_data.get('val', []) + \
+                     kp_processed_data.get('test', [])
+    total_samples = min(len(all_main_samples), len(all_kp_samples))
+    for batch_start in range(0, total_samples, batch_size):
+        batch_end = min(batch_start + batch_size, total_samples)
+        
+        print(f"\nProcessing batch {batch_start} to {batch_end - 1}...")
+
+        for sample_idx in range(batch_start, batch_end):
+            main_sample = all_main_samples[sample_idx]
+            kp_sample   = all_kp_samples[sample_idx]
+
+            stacked_data = np.array(main_sample['new_x'], dtype=np.float32)[:, :3] 
+            if 'y' not in kp_sample:
+              
+                continue
+            y_sample = np.array(kp_sample['y'], dtype=np.float32)  
+            print(f"\n=== Processing Sample {sample_idx} ===")
+            print(f" main_data shape={stacked_data.shape}, keypoints shape={y_sample.shape}")
+
+            shift_vector = np.zeros(3, dtype=np.float32)  
+            new_origin = shift_vector
+            n_frames = 5
+            frames_before_cleaning = split_data_into_frames(stacked_data, n_frames=n_frames)
+
+            frames_after_cleaning = []
+            for frame in frames_before_cleaning:
+                cleaned_frame = remove_null_placeholders_after_shift(frame, new_origin, threshold=0.01)
+                frames_after_cleaning.append(cleaned_frame)
+
+            cleaned_data = np.vstack(frames_after_cleaning)
+
+            dbscan_labels = []
+            for i, fr_clean in enumerate(frames_after_cleaning):
+                if fr_clean.size == 0: 
+            
+                    dbscan_labels.append(np.array([], dtype=np.int16))  
+                    continue
+                labels = apply_dbscan(fr_clean, eps=0.4, min_samples=6, xy_weight=1.0, z_weight=0.25)
+                dbscan_labels.append(labels)
+
+            all_centroids = []
+            for i, fr_clean in enumerate(frames_after_cleaning):
+                if i < len(dbscan_labels):
+                    labels = dbscan_labels[i]
+                else:
+                    continue 
+
+                unique_labels = set(labels)
+                unique_labels.discard(-1)
+                cdict = calculate_centroids(fr_clean, labels)
+                all_centroids.append(cdict)
+            tracks = build_tracks_across_frames(all_centroids, dbscan_labels, frames_after_cleaning)
+            if len(tracks) == 0:
+            continue
+            best_params = bayesian_optimize_kalman_params(tracks, max_frames=5, init_points=3, n_iter=10)
+            filtered_states, stabilization_steps = apply_kalman_filter_multi_frame_stabilize(
+                tracks,
+                threshold=2,
+                Q_val=best_params['q_val'],
+                R_val=best_params['r_val'],
+                P_val=best_params['p_val']
+            )
+           
+            track_errors = evaluate_kalman_prediction_quality(tracks, filtered_states)
+
+            
+            global KEYPOINTS_MEDIAN_GLOBAL
+            KEYPOINTS_MEDIAN_GLOBAL = np.median(y_sample, axis=0)
+
+           
+            best_tracks = evaluate_tracks_and_filter_out_others(
+                tracks, filtered_states, stabilization_steps, track_errors
+            )
+            if not best_tracks:
+              
+                continue
+
+            best_track_id, best_track = next(iter(best_tracks.items()))
+      
+            all_best_points = []
+            for item in best_track:
+                all_best_points.append(item['points'])
+            if len(all_best_points) == 0:
+                continue
+
+            all_best_points = np.vstack(all_best_points) 
+
+            
+            final_padded = pad_to_num_points(all_best_points, num_points=300)
+            original_label = main_sample.get('y', None)
+
+            final_sample_dict = {
+                'new_x': final_padded,
+                'y': original_label
+            }
+
+            split_ratio = np.random.rand()
+            if split_ratio < 0.8:
+                train_data.append(final_sample_dict)
+            elif split_ratio < 0.9:
+                val_data.append(final_sample_dict)
+            else:
+                test_data.append(final_sample_dict)
+            del main_sample, kp_sample, stacked_data, y_sample, shift_vector, new_origin
+            del frames_before_cleaning, frames_after_cleaning, cleaned_data
+            del dbscan_labels, all_centroids, tracks, best_params, filtered_states, stabilization_steps, track_errors
+            del best_tracks, best_track_id, best_track, all_best_points, final_padded, original_label, final_sample_dict
+            gc.collect()
+
+    
+        print(f"Saving batch {batch_start} to {batch_end - 1}...")
+        process_and_save_incremental(train_data, val_data, test_data, output_file='data/processed/mmr_action/mm1.pkl')
+
+if __name__ == '__main__':
+    main()
