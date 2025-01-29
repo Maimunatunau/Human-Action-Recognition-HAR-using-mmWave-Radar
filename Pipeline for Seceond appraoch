@@ -1,0 +1,1376 @@
+import os
+import pickle
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # For 3D plotting
+import math
+
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import MinMaxScaler
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
+from filterpy.kalman import KalmanFilter
+
+from bayes_opt import BayesianOptimization
+
+GLOBAL_TRACK_DISTANCES = {}
+KEYPOINTS_MEDIAN_GLOBAL = None
+
+def remove_null_placeholders_after_shift(frame, new_origin, threshold=0.01):
+
+    return frame[np.linalg.norm(frame - new_origin, axis=1) > threshold]
+
+def split_data_into_frames(stacked_data, n_frames=5):
+    frames = []
+    total_points = len(stacked_data)
+    frame_size = total_points // n_frames
+
+    start_idx = 0
+    for i in range(n_frames):
+        end_idx = start_idx + frame_size
+        if i == n_frames - 1:
+            frames.append(stacked_data[start_idx:])
+        else:
+            frames.append(stacked_data[start_idx:end_idx])
+        start_idx = end_idx
+    return frames
+
+def get_subplot_grid(n_plots, max_cols=5):
+    cols = min(n_plots, max_cols)
+    rows = math.ceil(n_plots / max_cols)
+    return rows, cols
+
+def plot_with_enhanced_keypoints(ax, data, keypoints, edges=None, title=None):
+  
+    if data is not None and len(data) > 0:
+        ax.scatter(data[:, 0], data[:, 1], data[:, 2],
+                   c='green', alpha=0.8, s=5, label='Point Cloud')
+
+    if keypoints is not None and len(keypoints) > 0:
+        ax.scatter(keypoints[:, 0], keypoints[:, 1], keypoints[:, 2],
+                   c='red', s=50, label='Keypoints')
+
+        if edges:
+            for idx, (s_idx, e_idx) in enumerate(edges):
+                if (s_idx < len(keypoints)) and (e_idx < len(keypoints)):
+                    x_vals = [keypoints[s_idx, 0], keypoints[e_idx, 0]]
+                    y_vals = [keypoints[s_idx, 1], keypoints[e_idx, 1]]
+                    z_vals = [keypoints[s_idx, 2], keypoints[e_idx, 2]]
+                    lbl = 'Skeleton' if idx == 0 else ""
+                    ax.plot(x_vals, y_vals, z_vals, c='blue', lw=2, label=lbl)
+
+    if title:
+        ax.set_title(title, pad=20, fontsize=12)
+    ax.set_xlabel('X (m)', labelpad=10)
+    ax.set_ylabel('Y (m)', labelpad=10)
+    ax.set_zlabel('Z (m)', labelpad=10)
+    ax.grid(True)
+
+    handles, labels = ax.get_legend_handles_labels()
+    unique = []
+    seen = set()
+    for h, l in zip(handles, labels):
+        if l not in seen and l != '':
+            unique.append((h, l))
+            seen.add(l)
+    if unique:
+        ax.legend(*zip(*unique), loc='upper right', bbox_to_anchor=(1.15, 1))
+
+def plot_original_dataset(data):
+    fig = plt.figure(figsize=(10, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(data[:, 0], data[:, 1], data[:, 2],
+               c='blue', s=10, alpha=0.8, label='Original Data')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title('3D Scatter Plot of Original Dataset')
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+def apply_dbscan(points, eps=0.4, min_samples=4, xy_weight=1.0, z_weight=0.25):
+    weighted_data = points.copy()
+    weighted_data[:, :2] *= xy_weight
+    weighted_data[:, 2] *= z_weight
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(weighted_data)
+    return clustering.labels_
+
+def calculate_centroids(frame, labels):
+    centroids = {}
+    unique_labels = np.unique(labels)
+    for lbl in unique_labels:
+        if lbl != -1:
+            cluster_points = frame[labels == lbl]
+            centroids[lbl] = np.mean(cluster_points, axis=0)
+    return centroids
+
+def calculate_and_plot_cost_matrix(centroidsA, centroidsB, title_suffix=""):
+    arrA = np.array(list(centroidsA.values()))
+    arrB = np.array(list(centroidsB.values()))
+
+    if len(arrA) == 0 or len(arrB) == 0:
+        return None, None, None
+
+    cost_matrix = cdist(arrA, arrB)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cost_matrix, cmap='viridis', interpolation='nearest')
+    plt.colorbar(im, ax=ax, label='Euclidean Distance')
+    ax.set_title(f'Cost Matrix {title_suffix}')
+    ax.set_xlabel('Centroids B')
+    ax.set_ylabel('Centroids A')
+    row_inds, col_inds = linear_sum_assignment(cost_matrix)
+
+    # Red box around matched pairs
+    for r, c in zip(row_inds, col_inds):
+        rect = plt.Rectangle((c - 0.5, r - 0.5), 1, 1,
+                             fill=False, edgecolor='red', linewidth=2)
+        ax.add_patch(rect)
+
+    # Cost text
+    for i in range(cost_matrix.shape[0]):
+        for j in range(cost_matrix.shape[1]):
+            ax.text(
+                j, i, f"{cost_matrix[i, j]:.2f}",
+                ha='center', va='center',
+                color='white', fontweight='bold'
+            )
+
+    plt.tight_layout()
+    plt.show()
+    return cost_matrix, row_inds, col_inds
+
+def match_centroids_between_frames(centroids_t, centroids_t1, frame_index=0):
+    cost_matrix, row_inds, col_inds = calculate_and_plot_cost_matrix(
+        centroids_t, centroids_t1, title_suffix=f"(frame {frame_index} -> {frame_index+1})"
+    )
+    return row_inds, col_inds, cost_matrix
+
+def build_tracks_across_frames(all_centroids, all_labels, all_clean_frames):
+    n_frames = len(all_centroids)
+    frame_label_centroid_maps = []
+    for i in range(n_frames):
+        cdict = all_centroids[i]
+        sorted_labels = sorted(list(cdict.keys()))
+        label_centroid_list = [(lbl, cdict[lbl]) for lbl in sorted_labels]
+        frame_label_centroid_maps.append(label_centroid_list)
+
+    centroids_list = []
+    for i in range(n_frames):
+        arr = np.array([pair[1] for pair in frame_label_centroid_maps[i]])  # just the centroids
+        centroids_list.append(arr)
+
+    track_positions = {}
+    if len(centroids_list[0]) > 0:
+        for i in range(len(centroids_list[0])):
+            lbl_i, centroid_i = frame_label_centroid_maps[0][i]
+            points_i = all_clean_frames[0][all_labels[0] == lbl_i]
+            track_positions[i] = [{
+                'frame_idx': 0,
+                'cluster_label': lbl_i,
+                'points': points_i,
+                'centroid': centroid_i
+            }]
+
+    for t in range(n_frames - 1):
+        arr_t = centroids_list[t]
+        arr_t1 = centroids_list[t+1]
+        if len(arr_t) == 0 or len(arr_t1) == 0:
+            continue
+
+        row_inds, col_inds, _ = match_centroids_between_frames(
+            dict(frame_label_centroid_maps[t]),
+            dict(frame_label_centroid_maps[t+1]),
+            frame_index=t
+        )
+        if row_inds is None or col_inds is None:
+            continue
+
+        print(f"\n=== Matching Results between Frame {t} and Frame {t+1} ===")
+        for r_idx, c_idx in zip(row_inds, col_inds):
+            lbl_t = frame_label_centroid_maps[t][r_idx][0]
+            centroid_t = frame_label_centroid_maps[t][r_idx][1]
+            lbl_t1 = frame_label_centroid_maps[t+1][c_idx][0]
+            centroid_t1 = frame_label_centroid_maps[t+1][c_idx][1]
+            points_t = all_clean_frames[t][all_labels[t] == lbl_t]
+            points_t1 = all_clean_frames[t+1][all_labels[t+1] == lbl_t1]
+            print(f"Match: Frame {t} Cluster {lbl_t} (Centroid: {centroid_t}) <--> Frame {t+1} Cluster {lbl_t1} (Centroid: {centroid_t1})")
+            print(f"  Points in Frame {t} Cluster {lbl_t}: {len(points_t)}")
+            print(f"  Points in Frame {t+1} Cluster {lbl_t1}: {len(points_t1)}")
+
+        matched_pairs = dict(zip(row_inds, col_inds))
+        for r_idx, c_idx in matched_pairs.items():
+            lbl_t = frame_label_centroid_maps[t][r_idx][0]
+            lbl_t1 = frame_label_centroid_maps[t+1][c_idx][0]
+            centroid_t1 = frame_label_centroid_maps[t+1][c_idx][1]
+            points_t1 = all_clean_frames[t+1][all_labels[t+1] == lbl_t1]
+            if r_idx in track_positions:
+                track_positions[r_idx].append({
+                    'frame_idx': t+1,
+                    'cluster_label': lbl_t1,
+                    'points': points_t1,
+                    'centroid': centroid_t1
+                })
+    tracks = {}
+    for tid, data_list in track_positions.items():
+        tracks[tid] = data_list
+    return tracks
+
+def bayesian_optimize_kalman_params(tracks, max_frames=5, init_points=5, n_iter=25):
+  
+    from bayes_opt import BayesianOptimization
+
+    def test_kalman_params(q_val, r_val, p_val):
+        total_error = 0.0
+        count = 0
+
+        for track_id, data_list in tracks.items():
+            if len(data_list) < 1:
+                continue
+            sorted_data = sorted(data_list, key=lambda x: x['frame_idx'])
+            centroids = [d['centroid'] for d in sorted_data]
+
+            kf = KalmanFilter(dim_x=4, dim_z=2)
+            dt = 1
+            kf.F = np.array([
+                [1, 0, dt, 0],
+                [0, 1, 0, dt],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1]
+            ], dtype=float)
+            kf.H = np.array([[1, 0, 0, 0],
+                             [0, 1, 0, 0]], dtype=float)
+            kf.Q = np.eye(4) * float(q_val)
+            kf.R = np.eye(2) * float(r_val)
+            kf.P = np.eye(4) * float(p_val)
+            kf.x = np.array([[centroids[0][0]],
+                             [centroids[0][1]],
+                             [0.0],
+                             [0.0]], dtype=float)
+
+            for i in range(1, min(len(centroids), max_frames)):
+                kf.predict()
+                meas = np.array([[centroids[i][0]], [centroids[i][1]]], dtype=float)
+                kf.update(meas)
+
+                pred_xy = kf.x[:2].flatten()
+                true_xy = centroids[i][:2]
+                error_xy = np.linalg.norm(pred_xy - true_xy)
+                total_error += error_xy
+                count += 1
+
+        if count == 0:
+            return 0.0
+        avg_error = total_error / count
+        return -avg_error
+
+    pbounds = {
+        'q_val': (1.0, 50.0),
+        'r_val': (0.01, 10.0),
+        'p_val': (1.0, 50.0)
+    }
+
+    optimizer = BayesianOptimization(
+        f=test_kalman_params,
+        pbounds=pbounds,
+        verbose=2,
+        random_state=42
+    )
+
+    optimizer.maximize(init_points=5, n_iter=15)
+
+    best_params = optimizer.max
+    print(f"\n=== Bayesian Optimization Completed ===")
+    print(f"Best Parameters (Q, R, P): {best_params['params']}")
+    print(f"Best Score (negative error): {best_params['target']}")
+
+    return best_params['params']
+
+def kalman_filter_init(dim_x=4, dim_z=2, Q_val=10.0, R_val=0.01, P_val=10.0):
+    kf = KalmanFilter(dim_x=dim_x, dim_z=dim_z)
+    dt = 1
+    kf.F = np.array([
+        [1, 0, dt, 0],
+        [0, 1, 0, dt],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1]
+    ], dtype=float)
+    kf.H = np.array([
+        [1, 0, 0, 0],
+        [0, 1, 0, 0]
+    ], dtype=float)
+    kf.Q = np.eye(dim_x) * Q_val
+    kf.R = np.eye(dim_z) * R_val
+    kf.P = np.eye(dim_x) * P_val
+    kf.x = np.array([[0.0], [0.0], [0.0], [0.0]], dtype=float)
+    return kf
+
+def apply_kalman_filter_multi_frame_stabilize(tracks, threshold=5e-2, Q_val=10.0, R_val=0.01, P_val=10.0):
+    filtered_states = {}
+    stabilization_steps = {}
+    for track_id, data_list in tracks.items():
+        if len(data_list) < 1:
+            filtered_states[track_id] = []
+            stabilization_steps[track_id] = None
+            continue
+        sorted_data_list = sorted(data_list, key=lambda x: x['frame_idx'])
+        centroids = [d['centroid'] for d in sorted_data_list]
+
+        kf = kalman_filter_init(dim_x=4, dim_z=2, Q_val=Q_val, R_val=R_val, P_val=P_val)
+        first_pos = centroids[0]
+        kf.x[0, 0] = first_pos[0]
+        kf.x[1, 0] = first_pos[1]
+
+        track_estimates = [kf.x.flatten()]
+        stabilized_step = None
+        prev_state = kf.x.copy()
+        iteration_count = 1
+        for i in range(1, len(centroids)):
+            kf.predict()
+            meas = np.array([[centroids[i][0]], [centroids[i][1]]], dtype=float)
+            kf.update(meas)
+            current_state = kf.x.copy()
+            track_estimates.append(current_state.flatten())
+            state_change = np.linalg.norm(current_state[:2] - prev_state[:2])
+            prev_state = current_state
+            iteration_count += 1
+            print(f"[Track {track_id}] Iteration {iteration_count}: state_change={state_change:.6f}")
+            if stabilized_step is None and state_change < threshold:
+                stabilized_step = i
+                print(f"[Track {track_id}] Stabilized at iteration {iteration_count} (frame {i})")
+
+        if stabilized_step is not None:
+            print(f"[Track {track_id}] Stabilization achieved at frame {stabilized_step}")
+        else:
+            print(f"[Track {track_id}] Stabilization not achieved within threshold.")
+
+        filtered_states[track_id] = track_estimates
+        stabilization_steps[track_id] = stabilized_step
+
+    return filtered_states, stabilization_steps
+
+def plot_kalman_state_changes_3d(filtered_states):
+    fig = plt.figure(figsize=(10, 7))
+    ax = fig.add_subplot(111, projection='3d')
+    cmap = plt.get_cmap('tab10')
+    colors = cmap.colors
+
+    for idx, (track_id, states) in enumerate(filtered_states.items()):
+        if len(states) > 1:
+            x_vals = [s[0] for s in states]
+            y_vals = [s[1] for s in states]
+            z_vals = [0 for _ in states]
+            color = colors[idx % len(colors)]
+            ax.plot(x_vals, y_vals, z_vals, marker='o', color=color, label=f"Track {track_id}")
+            for i in range(len(states) - 1):
+                start_x, start_y, start_z = x_vals[i], y_vals[i], z_vals[i]
+                end_x, end_y, end_z = x_vals[i+1], y_vals[i+1], z_vals[i+1]
+                dx = end_x - start_x
+                dy = end_y - start_y
+                dz = end_z - start_z
+                ax.quiver(start_x, start_y, start_z, dx, dy, dz,
+                          color='red', arrow_length_ratio=0.1)
+        else:
+            for s in states:
+                ax.scatter(s[0], s[1], 0, c='blue', marker='o', label=f"Track {track_id} (single)")
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title('Kalman Filter State Changes (3D Plot)')
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+def evaluate_kalman_prediction_quality(tracks, filtered_states):
+    print("\n=== Kalman Prediction Quality (RMSE) ===")
+    track_errors = {}
+    all_errors = {}
+    
+    plt.figure(figsize=(10, 6))
+    
+    for track_id, data_list in tracks.items():
+        if track_id not in filtered_states or len(filtered_states[track_id]) == 0:
+            continue
+
+        sorted_data = sorted(data_list, key=lambda x: x['frame_idx'])
+        states = filtered_states[track_id]
+
+        errors = []
+        for i in range(min(len(states), len(sorted_data))):
+            state_xy = states[i][0:2]
+            actual_centroid = sorted_data[i]['centroid']
+            error = np.linalg.norm(state_xy - actual_centroid[:2])
+            errors.append(error)
+
+        rmse = np.sqrt(np.mean(np.square(errors))) if errors else float('inf')
+        track_errors[track_id] = rmse
+        all_errors[track_id] = errors
+
+        print(f"\n[Track {track_id}] Kalman Filter Prediction RMSE: {rmse:.4f}")
+        for i, err_val in enumerate(errors):
+            print(f"  Frame {sorted_data[i]['frame_idx']} Error (XY) = {err_val:.4f}")
+
+        # Plot errors for this track
+        plt.plot(range(len(errors)), errors, marker='o', label=f"Track {track_id}")
+
+    plt.title("Kalman Filter Prediction Errors for All Tracks")
+    plt.xlabel("Segment")
+    plt.ylabel("Error Distance (m)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return track_errors
+
+def combine_tracks_union(trackA, trackB):
+
+    frame_dict = {}
+
+    def add_track_items(tr):
+        for item in tr:
+            f = item['frame_idx']
+            if f not in frame_dict:
+                # Insert a brand-new frame entry
+                frame_dict[f] = {
+                    'frame_idx': f,
+                    'points': item['points'].copy(),
+                    'centroid': item['centroid'].copy(),
+                    'cluster_label': item['cluster_label']
+                }
+            else:
+                # Merge points for that frame
+                existing_points = frame_dict[f]['points']
+                merged_points = np.vstack((existing_points, item['points']))
+                frame_dict[f]['points'] = merged_points
+                # Recompute centroid
+                frame_dict[f]['centroid'] = np.mean(merged_points, axis=0)
+
+    add_track_items(trackA)
+    add_track_items(trackB)
+
+    
+    combined = list(frame_dict.values())
+    combined.sort(key=lambda d: d['frame_idx'])
+    return combined
+
+
+def evaluate_tracks_and_filter_out_others(tracks, filtered_states, stabilization_steps, track_errors):
+    
+    if not filtered_states:
+        print("No tracks to evaluate.")
+        return {}
+    
+    global KEYPOINTS_MEDIAN_GLOBAL  
+
+    # Find best track based solely on RMSE
+    best_rmse_id = None
+    lowest_rmse = float('inf')
+    track_rmse_values = {}  # To store RMSE for each track
+    for track_id, states in filtered_states.items():
+        if len(states) < 2:
+            continue
+        rmse_vals = [
+            np.linalg.norm(states[i][:2] - states[i - 1][:2])
+            for i in range(1, len(states))
+        ]
+        rmse = np.sqrt(np.mean(np.square(rmse_vals))) if rmse_vals else float('inf')
+        track_rmse_values[track_id] = rmse  
+        print(f"Track ID: {track_id} RMSE: {rmse:.4f}")
+        if rmse < lowest_rmse:
+            lowest_rmse = rmse
+            best_rmse_id = track_id
+
+    # Find best track based solely on distance to keypoints median
+    best_distance_id = None
+    lowest_distance = float('inf')
+    for track_id, track_data in tracks.items():
+        if len(track_data) > 0:
+            all_points = np.vstack([item['points'] for item in track_data])
+            overall_centroid = np.mean(all_points, axis=0)
+            distance = np.linalg.norm(overall_centroid[:2] - KEYPOINTS_MEDIAN_GLOBAL[:2]) if KEYPOINTS_MEDIAN_GLOBAL is not None else float('inf')
+            print(f"Track ID: {track_id} Distance to Keypoints Median: {distance:.4f}")
+            if distance < lowest_distance:
+                lowest_distance = distance
+                best_distance_id = track_id
+
+    print(f"\nBest Track ID based on RMSE: {best_rmse_id} with RMSE={lowest_rmse:.4f}")
+    print(f"Best Track ID based on Distance: {best_distance_id} with distance={lowest_distance:.4f}")
+
+
+    best_tracks = {}
+
+    if best_rmse_id == best_distance_id and best_rmse_id is not None:
+        print("\n[LOGIC] RMSE best track == Distance best track.")
+        # Check how many tracks exist in total
+        total_track_count = len(tracks)
+
+        if total_track_count == 1:
+            # We only have one track in total, so select that track
+            print("Only 1 track total. Selecting this single track as best.")
+            best_tracks[best_rmse_id] = tracks[best_rmse_id]
+
+        elif total_track_count == 2:
+            # If exactly 2 tracks exist, combine them by union-of-points
+            print("Exactly 2 tracks total. Combining them by union of points.")
+            track_ids = list(tracks.keys())
+            if len(track_ids) == 2:
+                t1, t2 = track_ids[0], track_ids[1]
+                union_track = combine_tracks_union(tracks[t1], tracks[t2])
+                best_tracks["combined"] = union_track
+
+        else:
+            # More than 2 tracks. Let's pick a second best
+            print(f"More than 2 tracks ({total_track_count}). Checking second-best track.")
+            # We'll do a simple approach: pick the second-lowest RMSE track
+            second_best_rmse_id = None
+            second_lowest_rmse = float('inf')
+
+            for tid, val in track_rmse_values.items():
+                if tid != best_rmse_id and val < second_lowest_rmse:
+                    second_lowest_rmse = val
+                    second_best_rmse_id = tid
+
+            if second_best_rmse_id is None:
+                print("No second-best track found by RMSE. Selecting just the first one.")
+                best_tracks[best_rmse_id] = tracks[best_rmse_id]
+            else:
+                print(f"Second best RMSE track is {second_best_rmse_id} with RMSE {second_lowest_rmse:.4f}. Combining with best track by union.")
+                best_rmse_track = tracks[best_rmse_id]
+                second_best_track = tracks[second_best_rmse_id]
+                combined_track = combine_tracks_union(best_rmse_track, second_best_track)
+                best_tracks["combined"] = combined_track
+
+    else:
+        # If different, then combine them as usual
+        if best_rmse_id is not None and best_distance_id is not None:
+            best_rmse_track = tracks[best_rmse_id]
+            best_distance_track = tracks[best_distance_id]
+            combined_track = combine_tracks_union(best_rmse_track, best_distance_track)
+            print(f"\nSelected Best Track ID based on RMSE and Distance combination: combined")
+            best_tracks["combined"] = combined_track
+        else:
+            print("Insufficient tracks for combination.")
+            return {}
+
+    return best_tracks
+
+
+def plot_all_tracks_across_stages(y_sample, all_tracks, edges=None):
+    import torch
+    if torch.is_tensor(y_sample):
+        keypoints = y_sample.cpu().numpy()
+    else:
+        keypoints = y_sample
+    median_point = np.median(keypoints, axis=0)
+
+    # Precompute overall centroid distances for each track
+    track_distances = {}
+    for track_id, track_data in all_tracks.items():
+        track_centroids = np.array([d['centroid'] for d in track_data])
+        if len(track_centroids) > 0:
+            overall_centroid = np.mean(track_centroids, axis=0)
+            track_distances[track_id] = np.linalg.norm(overall_centroid[:2] - median_point[:2])
+
+    stage_names = ["After Null Removal", "After DBSCAN", "After Splitting", "After Hungarian Match", "After Kalman"]
+    fig = plt.figure(figsize=(25, 5))
+
+    for i, stage in enumerate(stage_names):
+        ax = fig.add_subplot(1, 5, i+1, projection='3d')
+        ax.scatter(keypoints[:, 0], keypoints[:, 1], keypoints[:, 2], c='red', s=50, label='Keypoints')
+        if edges:
+            for start_idx, end_idx in edges:
+                x_vals = [keypoints[start_idx, 0], keypoints[end_idx, 0]]
+                y_vals = [keypoints[start_idx, 1], keypoints[end_idx, 1]]
+                z_vals = [keypoints[start_idx, 2], keypoints[end_idx, 2]]
+                ax.plot(x_vals, y_vals, z_vals, c="blue", lw=2)
+
+        for track_id, track_data in all_tracks.items():
+            if i < len(track_data) and len(track_data[i]) > 0:
+                stage_data = track_data[i][0]
+                label = f"Track {track_id} Points"
+                ax.scatter(stage_data['points'][:, 0], stage_data['points'][:, 1], stage_data['points'][:, 2],
+                           marker='o', label=label)
+                distance = track_distances.get(track_id, 0)
+                ax.plot([median_point[0], stage_data['centroid'][0]],
+                        [median_point[1], stage_data['centroid'][1]],
+                        [median_point[2], stage_data['centroid'][2]],
+                        c='black', linestyle='--')
+                ax.text(stage_data['centroid'][0], stage_data['centroid'][1], stage_data['centroid'][2],
+                        f"{distance:.2f}m", color='black')
+
+        ax.set_title(f"{stage}")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_three_best_tracks(
+        original_data,          
+        tracks,                 
+        best_tracks,            
+        best_rmse_id,           
+        best_distance_id,       
+        best_combined_id,        
+        y_sample,               
+        edges=None              
+    ):
+        sorted_tracks = sorted(tracks.items(), key=lambda item: sum(len(p['points']) for p in item[1]), reverse=True)
+        best_track_id = best_rmse_id
+        second_best_track_id = sorted_tracks[1][0] if len(sorted_tracks) > 1 else None
+
+        
+        combined_track = best_tracks.get(best_combined_id, [])
+        combined_track_points = np.vstack([p['points'] for p in combined_track]) if combined_track else np.empty((0, 3))
+        fig = plt.figure(figsize=(32, 8))  
+
+        # -- SUBPLOT 1: Original Scatter Plot
+        ax1 = fig.add_subplot(1, 4, 1, projection='3d')
+        ax1.scatter(original_data[:, 0], original_data[:, 1], original_data[:, 2],
+                   c='blue', s=5, alpha=0.5, label='Original Points')
+        ax1.set_title("Original Point Cloud", fontsize=14, pad=20)
+        ax1.set_xlabel("X (m)", labelpad=10)
+        ax1.set_ylabel("Y (m)", labelpad=10)
+        ax1.set_zlabel("Z (m)", labelpad=10)
+        ax1.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+
+        # -- SUBPLOT 2: Best Track
+        ax2 = fig.add_subplot(1, 4, 2, projection='3d')
+        if best_track_id is not None and best_track_id in tracks and len(tracks[best_track_id]) > 0:
+            best_track_points = np.vstack([p['points'] for p in tracks[best_track_id]])
+            ax2.scatter(best_track_points[:, 0], best_track_points[:, 1], best_track_points[:, 2],
+                       c='orange', s=7, alpha=0.6, label=f'Best Track (ID: {best_track_id})')
+            # Calculate centroid for annotation
+            centroid_best = np.mean(best_track_points, axis=0)
+            # ax2.scatter(centroid_best[0], centroid_best[1], centroid_best[2], c='black', s=50, marker='x')
+        else:
+            ax2.text(0.5, 0.5, 0.5, "No Best Track Found", horizontalalignment='center',
+                     verticalalignment='center', transform=ax2.transAxes, fontsize=12, color='red')
+        ax2.set_title("Best Track", fontsize=14, pad=20)
+        ax2.set_xlabel("X (m)", labelpad=10)
+        ax2.set_ylabel("Y (m)", labelpad=10)
+        ax2.set_zlabel("Z (m)", labelpad=10)
+        ax2.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+
+        # -- SUBPLOT 3: Second Best Track
+        ax3 = fig.add_subplot(1, 4, 3, projection='3d')
+        if second_best_track_id is not None and second_best_track_id in tracks and len(tracks[second_best_track_id]) > 0:
+            second_best_track_points = np.vstack([p['points'] for p in tracks[second_best_track_id]])
+            ax3.scatter(second_best_track_points[:, 0], second_best_track_points[:, 1], second_best_track_points[:, 2],
+                       c='cyan', s=7, alpha=0.6, label=f'Second Best Track (ID: {second_best_track_id})')
+            # Calculate centroid for annotation
+            centroid_second = np.mean(second_best_track_points, axis=0)
+            # Optional: Uncomment the following line if you want to mark the centroid
+            # ax3.scatter(centroid_second[0], centroid_second[1], centroid_second[2], c='black', s=50, marker='x')
+        else:
+            ax3.text(0.5, 0.5, 0.5, "No Second Best Track Found", horizontalalignment='center',
+                     verticalalignment='center', transform=ax3.transAxes, fontsize=12, color='red')
+        ax3.set_title("Second Best Track", fontsize=14, pad=20)
+        ax3.set_xlabel("X (m)", labelpad=10)
+        ax3.set_ylabel("Y (m)", labelpad=10)
+        ax3.set_zlabel("Z (m)", labelpad=10)
+        ax3.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+
+        # -- SUBPLOT 4: Combined Track (Best + Second Best)
+        ax4 = fig.add_subplot(1, 4, 4, projection='3d')
+        if combined_track_points.size > 0:
+            ax4.scatter(combined_track_points[:, 0], combined_track_points[:, 1], combined_track_points[:, 2],
+                       c='magenta', s=7, alpha=0.6, label='Combined Track')
+            centroid_combined = np.mean(combined_track_points, axis=0)
+            # ax4.scatter(centroid_combined[0], centroid_combined[1], centroid_combined[2], c='black', s=50, marker='x')
+            ax4.set_title("Combined Track (Best + Second Best)", fontsize=14, pad=20)
+            if edges is not None and len(y_sample) > 0:
+                for start_idx, end_idx in edges:
+                    if start_idx < len(y_sample) and end_idx < len(y_sample):
+                        x_vals = [y_sample[start_idx, 0], y_sample[end_idx, 0]]
+                        y_vals = [y_sample[start_idx, 1], y_sample[end_idx, 1]]
+                        z_vals = [y_sample[start_idx, 2], y_sample[end_idx, 2]]
+                        ax4.plot(x_vals, y_vals, z_vals, c='black')
+        else:
+            ax4.text(0.5, 0.5, 0.5, "No Combined Track Found", horizontalalignment='center',
+                     verticalalignment='center', transform=ax4.transAxes, fontsize=12, color='red')
+        ax4.set_xlabel("X (m)", labelpad=10)
+        ax4.set_ylabel("Y (m)", labelpad=10)
+        ax4.set_zlabel("Z (m)", labelpad=10)
+        ax4.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+
+        plt.tight_layout()
+        plt.show()
+
+
+
+def plot_four_subplots(
+    original_data,    # full uncleaned data (for Subplot 1)
+    cleaned_data,     # the data actually used for DBSCAN (same shape as dbscan_labels)
+    dbscan_labels, 
+    tracks, 
+    best_track, 
+    y_sample, 
+    edges
+):
+
+    # -- SUBPLOT 1: Plot the original (full) data as-is
+    fig = plt.figure(figsize=(20, 15))
+
+    ax1 = fig.add_subplot(2, 2, 1, projection='3d')
+    ax1.scatter(original_data[:, 0], original_data[:, 1], original_data[:, 2],
+                c='blue', s=5, alpha=0.5, label='Original Points')
+    ax1.set_title("Original Point Cloud")
+    ax1.set_xlabel("X (m)")
+    ax1.set_ylabel("Y (m)")
+    ax1.set_zlabel("Z (m)")
+    ax1.legend()
+
+    # -- SUBPLOT 2: Biggest DBSCAN Cluster from cleaned_data
+    all_labels = np.concatenate(dbscan_labels)
+    valid_mask = (all_labels != -1)
+    valid_labels = all_labels[valid_mask]
+    if len(valid_labels) == 0:
+        biggest_cluster_points = np.empty((0, 3))
+        biggest_cluster_label = None
+    else:
+        unique_lbls, counts = np.unique(valid_labels, return_counts=True)
+        sorted_indices = np.argsort(counts)[::-1]
+        # Get top two clusters if available
+        num_top_clusters = 2
+        top_clusters = unique_lbls[sorted_indices[:num_top_clusters]]
+    
+        ax2 = fig.add_subplot(2, 2, 2, projection='3d')
+        for lbl in top_clusters:
+            cluster_indices = (all_labels == lbl)
+            cluster_points = cleaned_data[cluster_indices]
+            ax2.scatter(cluster_points[:, 0], cluster_points[:, 1], cluster_points[:, 2],
+                        label=f'Cluster {lbl}', s=10, alpha=0.5)
+            # Calculate centroid for annotation
+            centroid = np.mean(cluster_points, axis=0)
+            ax2.text(centroid[0], centroid[1], centroid[2],
+                     f'ID: {lbl}', color='black', fontsize=12)
+        if len(top_clusters) == 0:
+            ax2.text(0.5, 0.5, 0.5, "No Cluster Found", horizontalalignment='center',
+                     verticalalignment='center', transform=ax2.transAxes, fontsize=12, color='red')
+        ax2.set_title("Top DBSCAN Clusters (Cleaned Data)")
+        ax2.set_xlabel("X (m)")
+        ax2.set_ylabel("Y (m)")
+        ax2.set_zlabel("Z (m)")
+        ax2.legend()
+
+    # -- SUBPLOT 3: Biggest Track from your 'tracks'
+    if not tracks:
+        biggest_track_points = np.empty((0, 3))
+        biggest_track_id = None
+    else:
+        track_point_counts = {tid: sum(len(p['points']) for p in tracks[tid]) for tid in tracks}
+        biggest_track_id = max(track_point_counts, key=track_point_counts.get)
+        biggest_track = tracks[biggest_track_id]
+        if biggest_track:
+            biggest_track_points = np.vstack([p['points'] for p in biggest_track])
+        else:
+            biggest_track_points = np.empty((0, 3))
+    
+    ax3 = fig.add_subplot(2, 2, 3, projection='3d')
+    if biggest_track_points.size > 0:
+        ax3.scatter(biggest_track_points[:, 0], biggest_track_points[:, 1], biggest_track_points[:, 2],
+                    c='orange', s=10, alpha=0.5, label='Biggest Track')
+        # Calculate centroid for annotation
+        centroid = np.mean(biggest_track_points, axis=0)
+        ax3.text(centroid[0], centroid[1], centroid[2],
+                 f'Track ID: {biggest_track_id}', color='black', fontsize=12)
+    else:
+        ax3.text(0.5, 0.5, 0.5, "No Track Found", horizontalalignment='center',
+                 verticalalignment='center', transform=ax3.transAxes, fontsize=12, color='red')
+    ax3.set_title("Biggest Track")
+    ax3.set_xlabel("X (m)")
+    ax3.set_ylabel("Y (m)")
+    ax3.set_zlabel("Z (m)")
+    ax3.legend()
+
+    # -- SUBPLOT 4: Best Human Cluster (best_track) with stretch/padding
+    if not best_track:
+        print("No best track available.")
+        best_human_cluster_points = np.empty((0, 3))
+    else:
+        best_human_cluster_points = np.vstack([p['points'] for p in best_track])
+        centroid = np.mean(best_human_cluster_points, axis=0)
+        scale_factor = 0.8
+        scaled = (best_human_cluster_points - centroid) * scale_factor + centroid
+        padding_percentage = 0.1
+        min_vals = scaled.min(axis=0)
+        max_vals = scaled.max(axis=0)
+        padding = (max_vals - min_vals) * padding_percentage
+        best_human_cluster_padded = scaled + padding
+        best_human_cluster_points = best_human_cluster_padded
+
+    ax4 = fig.add_subplot(2, 2, 4, projection='3d')
+    if best_human_cluster_points.size > 0:
+        ax4.scatter(best_human_cluster_points[:, 0], best_human_cluster_points[:, 1], best_human_cluster_points[:, 2],
+                    c='red', s=10, alpha=0.5, label='Best Human Cluster')
+        # Optionally, connect keypoints if desired
+        if edges is not None and len(y_sample) > 0:
+            for start_idx, end_idx in edges:
+                if start_idx < len(y_sample) and end_idx < len(y_sample):
+                    x_vals = [y_sample[start_idx, 0], y_sample[end_idx, 0]]
+                    y_vals = [y_sample[start_idx, 1], y_sample[end_idx, 1]]
+                    z_vals = [y_sample[start_idx, 2], y_sample[end_idx, 2]]
+                    ax4.plot(x_vals, y_vals, z_vals, c='black', linestyle='--', linewidth=1)
+        ax4.set_title("Best Human Cluster ")
+        ax4.set_xlabel("X (m)")
+        ax4.set_ylabel("Y (m)")
+        ax4.set_zlabel("Z (m)")
+        ax4.legend()
+    else:
+        ax4.text(0.5, 0.5, 0.5, "No Best Human Cluster Found", horizontalalignment='center',
+                 verticalalignment='center', transform=ax4.transAxes, fontsize=12, color='red')
+        ax4.set_title("Best Human Cluster ")
+        ax4.set_xlabel("X (m)")
+        ax4.set_ylabel("Y (m)")
+        ax4.set_zlabel("Z (m)")
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+def main():
+    edges = [(8, 0), (8, 2), (0, 1), (2, 3), (0, 4), (2, 6), (4, 5), (6, 7)]
+
+    main_file_path = 'data/processed/mmr_action/data.pkl'
+    if not os.path.exists(main_file_path):
+        print(f"Error: The file {main_file_path} does not exist.")
+        return
+    with open(main_file_path, 'rb') as f_main:
+        main_processed_data = pickle.load(f_main)
+    all_main_samples = main_processed_data.get('train', [])
+    print(f"Loaded {len(all_main_samples)} main samples from {main_file_path} (train).")
+
+    kp_file_path = 'data/processed/mmr_kp/datak.pkl'
+    if not os.path.exists(kp_file_path):
+        print(f"Error: The file {kp_file_path} does not exist.")
+        return
+    with open(kp_file_path, 'rb') as f_kp:
+        kp_processed_data = pickle.load(f_kp)
+    all_kp_samples = kp_processed_data.get('train', [])
+    print(f"Loaded {len(all_kp_samples)} keypoint samples from {kp_file_path} (train).")
+
+    sample_index = 6789
+    if sample_index >= len(all_main_samples) or sample_index >= len(all_kp_samples):
+        print(f"Error: sample_index={sample_index} out of range in either main or keypoint data.")
+        return
+
+    main_sample = all_main_samples[sample_index]
+    kp_sample   = all_kp_samples[sample_index]
+
+    stacked_data = np.array(main_sample['new_x'])[:, :3]
+    if 'y' not in kp_sample:
+        print("Error: 'y' not found in kp_sample. Cannot load keypoints.")
+        return
+    y_sample = np.array(kp_sample['y'])  
+    print(f"Sample index {sample_index}: main_data shape={stacked_data.shape}, keypoints shape={y_sample.shape}")
+
+    shift_vector = np.zeros(3)
+    new_origin = shift_vector
+
+    print("\n=== Plotting Original Point Cloud and Keypoints ===")
+    fig = plt.figure(figsize=(14, 6))
+    ax1 = fig.add_subplot(1, 2, 1, projection='3d')
+    ax1.scatter(stacked_data[:, 0], stacked_data[:, 1], stacked_data[:, 2],
+                c='blue', alpha=0.5, label='Raw Points')
+    ax1.set_title("Original Point Cloud")
+    ax1.legend()
+
+    ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+    plot_with_enhanced_keypoints(ax2, stacked_data, y_sample, edges=edges,
+                                 title="Point Cloud + Keypoints")
+    plt.tight_layout()
+    plt.show()
+
+    print("\n=== Detailed Temporal Segment Analysis ===")
+    n_frames = 5
+    frames_before_cleaning = split_data_into_frames(stacked_data, n_frames=n_frames)
+
+    print("\nPoints per segment before null removal:")
+    for i, frame in enumerate(frames_before_cleaning):
+        print(f"Segment {i+1}: {len(frame)} points")
+
+    print("\n=== Plotting Segments Before Null Removal ===")
+    rows, cols = get_subplot_grid(n_frames, max_cols=5)
+    fig = plt.figure(figsize=(6 * cols, 6 * rows))
+    fig.suptitle('Temporal Segment Analysis Before Null Removal', fontsize=14, y=1.02)
+    for i, frame in enumerate(frames_before_cleaning):
+        ax = fig.add_subplot(rows, cols, i+1, projection='3d')
+        ax.scatter(frame[:, 0], frame[:, 1], frame[:, 2],
+                  c='blue', alpha=0.5, label='Points')
+        ax.set_title(f"Segment {i+1}\n{len(frame)} points", pad=10, fontsize=10)
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_zlabel('Z (m)')
+        ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+    print("\n=== Plotting Segments Before Null Removal with Keypoints ===")
+    fig = plt.figure(figsize=(6 * cols, 6 * rows))
+    fig.suptitle('Temporal Segment Analysis Before Null Removal with Keypoints', fontsize=14, y=1.02)
+    for i, frame in enumerate(frames_before_cleaning):
+        ax = fig.add_subplot(rows, cols, i+1, projection='3d')
+        plot_with_enhanced_keypoints(ax, frame, y_sample, edges=edges,
+                                     title=f"Segment {i+1} with Keypoints")
+    plt.tight_layout()
+    plt.show()
+
+    print("\n=== Centroid Distance Analysis Before Cleaning ===")
+    rows_centroid, cols_centroid = get_subplot_grid(n_frames, max_cols=5)
+    fig = plt.figure(figsize=(6 * cols_centroid, 6 * rows_centroid))
+    fig.suptitle('Centroid Distance Analysis Before Null Removal', fontsize=14, y=1.02)
+    keypoints_median = np.median(y_sample, axis=0)
+    global KEYPOINTS_MEDIAN_GLOBAL
+    KEYPOINTS_MEDIAN_GLOBAL = keypoints_median
+    for i, frame in enumerate(frames_before_cleaning):
+        ax = fig.add_subplot(rows_centroid, cols_centroid, i+1, projection='3d')
+        plot_with_enhanced_keypoints(ax, frame, y_sample, edges=edges,
+                                     title=f"Segment {i+1} Before Cleaning")
+        if len(frame) > 0:
+            centroid = np.mean(frame, axis=0)
+            distance = np.linalg.norm(centroid[:2] - keypoints_median[:2])
+            ax.scatter(centroid[0], centroid[1], centroid[2],
+                       c='purple', marker='o', s=100, label='Centroid')
+            ax.plot([keypoints_median[0], centroid[0]],
+                    [keypoints_median[1], centroid[1]],
+                    [keypoints_median[2], centroid[2]],
+                    c='black', linestyle='--')
+            ax.set_title(f"Segment {i+1} Before Cleaning\nDistance: {distance:.2f}m", pad=10, fontsize=10)
+            handles, labels_plot = ax.get_legend_handles_labels()
+            unique = []
+            seen = set()
+            for h, l in zip(handles, labels_plot):
+                if l not in seen and l != '':
+                    unique.append((h, l))
+                    seen.add(l)
+            if unique:
+                ax.legend(*zip(*unique), loc='upper right', bbox_to_anchor=(1.15, 1))
+    plt.tight_layout()
+    plt.show()
+
+    frames_after_cleaning = []
+    print("\nPoints per segment after null removal:")
+    for i, frame in enumerate(frames_before_cleaning):
+        cleaned_frame = remove_null_placeholders_after_shift(frame, new_origin, threshold=0.01)
+        frames_after_cleaning.append(cleaned_frame)
+        removed_points = len(frame) - len(cleaned_frame)
+        print(f"Segment {i+1}: {len(cleaned_frame)} points (removed {removed_points} points)")
+
+    print("\n=== Plotting Segments After Null Removal ===")
+    rows_clean, cols_clean = get_subplot_grid(n_frames, max_cols=5)
+    fig = plt.figure(figsize=(6 * cols_clean, 6 * rows_clean))
+    fig.suptitle('Temporal Segment Analysis After Null Removal', fontsize=14, y=1.02)
+    for i, frame in enumerate(frames_after_cleaning):
+        ax = fig.add_subplot(rows_clean, cols_clean, i+1, projection='3d')
+        ax.scatter(frame[:, 0], frame[:, 1], frame[:, 2],
+                  c='green', alpha=0.5, label='Cleaned Points')
+        ax.set_title(f"Segment {i+1}\n{len(frame)} points", pad=10, fontsize=10)
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_zlabel('Z (m)')
+        ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+    print("\n=== Plotting Segments After Null Removal with Keypoints ===")
+    fig = plt.figure(figsize=(6 * cols_clean, 6 * rows_clean))
+    fig.suptitle('Temporal Segment Analysis After Null Removal with Keypoints', fontsize=14, y=1.02)
+    for i, frame in enumerate(frames_after_cleaning):
+        ax = fig.add_subplot(rows_clean, cols_clean, i+1, projection='3d')
+        plot_with_enhanced_keypoints(ax, frame, y_sample, edges=edges,
+                                     title=f"Segment {i+1} Cleaned with Keypoints")
+        if len(frame) > 0:
+            centroid = np.mean(frame, axis=0)
+            distance = np.linalg.norm(centroid[:2] - keypoints_median[:2])
+            ax.scatter(centroid[0], centroid[1], centroid[2],
+                       c='purple', marker='o', s=100, label='Centroid')
+            ax.plot([keypoints_median[0], centroid[0]],
+                    [keypoints_median[1], centroid[1]],
+                    [keypoints_median[2], centroid[2]],
+                    c='black', linestyle='--')
+            ax.set_title(f"Segment {i+1} Cleaned\nDistance: {distance:.2f}m", pad=10, fontsize=10)
+            handles, labels_plot = ax.get_legend_handles_labels()
+            unique = []
+            seen = set()
+            for h, l in zip(handles, labels_plot):
+                if l not in seen and l != '':
+                    unique.append((h, l))
+                    seen.add(l)
+            if unique:
+                ax.legend(*zip(*unique), loc='upper right', bbox_to_anchor=(1.15, 1))
+    plt.tight_layout()
+    plt.show()
+
+    print("\n=== DBSCAN Clustering Analysis ===")
+    cleaned_data = np.vstack(frames_after_cleaning)
+    
+    print(f"\nTotal cleaned points: {cleaned_data.shape[0]}")
+
+    dbscan_labels = []
+    cluster_info = []
+    for i, fr_clean in enumerate(frames_after_cleaning):
+        labels = apply_dbscan(fr_clean, eps=0.4, min_samples=6,
+                              xy_weight=1.0, z_weight=0.25)
+        dbscan_labels.append(labels)
+        unique_labels = set(labels)
+        unique_labels.discard(-1)
+        num_clusters = len(unique_labels)
+        print(f"\nSegment {i+1}: {num_clusters} clusters found (excluding noise)")
+        cluster_counts = {}
+        for lbl in unique_labels:
+            count = np.sum(labels == lbl)
+            cluster_counts[lbl] = count
+            print(f"  Cluster {lbl}: {count} points")
+        cluster_info.append(cluster_counts)
+    all_labels = np.concatenate(dbscan_labels)
+    assert len(all_labels) == len(cleaned_data), "Mismatch between cleaned data points and DBSCAN labels."
+
+    print("\n=== Plotting DBSCAN Clustering Results ===")
+    rows_dbscan, cols_dbscan = get_subplot_grid(n_frames, max_cols=5)
+    fig, axes = plt.subplots(2, cols_dbscan, figsize=(6 * cols_dbscan, 6 * 2),
+                             subplot_kw={'projection': '3d'})
+    fig.suptitle('DBSCAN Clustering Results', fontsize=16, y=0.95)
+    colors_cmap = plt.get_cmap('tab20', 20)
+    for i, (frame, labels) in enumerate(zip(frames_after_cleaning, dbscan_labels)):
+        row_idx = 0
+        col_idx = i % cols_dbscan
+        ax = axes[row_idx, col_idx]
+        unique_labels = set(labels)
+        unique_labels.discard(-1)
+        for lbl in unique_labels:
+            cluster_points = frame[labels == lbl]
+            ax.scatter(cluster_points[:, 0], cluster_points[:, 1], cluster_points[:, 2],
+                       c=[colors_cmap(lbl % 20)], label=f'Cluster {lbl}', s=20)
+        noise_points = frame[labels == -1]
+        if len(noise_points) > 0:
+            ax.scatter(noise_points[:, 0], noise_points[:, 1], noise_points[:, 2],
+                       c='k', label='Noise', s=20)
+        ax.set_title(f"Segment {i+1} Clusters", pad=10, fontsize=10)
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_zlabel('Z (m)')
+        handles, labels_plot = ax.get_legend_handles_labels()
+        unique = []
+        seen = set()
+        for h, l in zip(handles, labels_plot):
+            if l not in seen and l != '':
+                unique.append((h, l))
+                seen.add(l)
+        if unique:
+            ax.legend(*zip(*unique), loc='upper right', bbox_to_anchor=(1.15, 1))
+    for i, (frame, labels) in enumerate(zip(frames_after_cleaning, dbscan_labels)):
+        row_idx = 1
+        col_idx = i % cols_dbscan
+        ax = axes[row_idx, col_idx]
+        unique_labels = set(labels)
+        unique_labels.discard(-1)
+        for lbl in unique_labels:
+            cluster_points = frame[labels == lbl]
+            centroid = np.mean(cluster_points, axis=0)
+            ax.scatter(cluster_points[:, 0], cluster_points[:, 1], cluster_points[:, 2],
+                       c=[colors_cmap(lbl % 20)], label=f'Cluster {lbl}', s=20)
+            ax.scatter(centroid[0], centroid[1], centroid[2],
+                       c='purple', marker='o', s=100, label='Centroid')
+            ax.plot([keypoints_median[0], centroid[0]],
+                    [keypoints_median[1], centroid[1]],
+                    [keypoints_median[2], centroid[2]],
+                    c='black', linestyle='--')
+            distance = np.linalg.norm(centroid[:2] - keypoints_median[:2])
+            ax.text((keypoints_median[0] + centroid[0])/2,
+                    (keypoints_median[1] + centroid[1])/2,
+                    centroid[2],
+                    f"{distance:.2f}m", color='black')
+        noise_points = frame[labels == -1]
+        if len(noise_points) > 0:
+            ax.scatter(noise_points[:, 0], noise_points[:, 1], noise_points[:, 2],
+                       c='k', label='Noise', s=20)
+        plot_with_enhanced_keypoints(ax, frame, y_sample, edges=edges,
+                                     title=f"Segment {i+1} Clusters with Keypoints")
+        ax.set_title(f"Segment {i+1} Clusters with Distances", pad=10, fontsize=10)
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_zlabel('Z (m)')
+        handles, labels_plot = ax.get_legend_handles_labels()
+        unique = []
+        seen = set()
+        for h, l in zip(handles, labels_plot):
+            if l not in seen and l != '':
+                unique.append((h, l))
+                seen.add(l)
+        if unique:
+            ax.legend(*zip(*unique), loc='upper right', bbox_to_anchor=(1.15, 1))
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
+    all_centroids = []
+    for i, fr_clean in enumerate(frames_after_cleaning):
+        cdict = calculate_centroids(fr_clean, dbscan_labels[i])
+        all_centroids.append(cdict)
+    tracks = build_tracks_across_frames(all_centroids, dbscan_labels, frames_after_cleaning)
+    print(f"\nTotal tracks formed: {len(tracks)}")
+
+    print("\n=== Plotting Tracks Across Frames ===")
+    fig_tracks = plt.figure(figsize=(10, 7))
+    ax_tracks = fig_tracks.add_subplot(111, projection='3d')
+    cmap = plt.get_cmap('tab10')
+    colors = cmap.colors
+    for track_id, track_data in tracks.items():
+        track_centroids = np.array([d['centroid'] for d in track_data])
+        ax_tracks.plot(track_centroids[:, 0], track_centroids[:, 1], track_centroids[:, 2],
+                       marker='o', label=f"Track {track_id}", color=colors[track_id % len(colors)])
+        ax_tracks.scatter(track_centroids[:, 0], track_centroids[:, 1], track_centroids[:, 2],
+                          c='red', s=50)
+    plot_with_enhanced_keypoints(ax_tracks, np.vstack(frames_after_cleaning), y_sample, edges=edges,
+                                 title="All Tracks with Keypoints")
+    ax_tracks.set_xlabel('X (m)')
+    ax_tracks.set_ylabel('Y (m)')
+    ax_tracks.set_zlabel('Z (m)')
+    ax_tracks.legend()
+    plt.tight_layout()
+    plt.show()
+
+    num_tracks = len(tracks)
+    if num_tracks > 0:
+        for track_id, track in tracks.items():
+            fig_tracks, axes_tracks = plt.subplots(1, 3, figsize=(18, 6), subplot_kw={'projection': '3d'})
+            fig_tracks.suptitle(f'Track {track_id} Across Segments', fontsize=16, y=1.02)
+
+            ax_top = axes_tracks[0]
+            for point in track:
+                frame_idx = point["frame_idx"]
+                ax_top.scatter(point["points"][:, 0], point["points"][:, 1], point["points"][:, 2],
+                               label=f'Frame {frame_idx +1}', s=20)
+            ax_top.set_title(f"Track {track_id} Points Across Segments")
+            ax_top.set_xlabel('X (m)')
+            ax_top.set_ylabel('Y (m)')
+            ax_top.set_zlabel('Z (m)')
+            ax_top.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+
+            ax_middle = axes_tracks[1]
+            for point in track:
+                frame_idx = point["frame_idx"]
+                plot_with_enhanced_keypoints(ax_middle, point["points"], y_sample, edges=edges, 
+                                             title=f"Track {track_id} Segment {frame_idx +1}")
+                centroid = point["centroid"]
+                ax_middle.scatter(centroid[0], centroid[1], centroid[2], 
+                                  c='purple', marker='o', s=100, label='Centroid')
+                ax_middle.plot([KEYPOINTS_MEDIAN_GLOBAL[0], centroid[0]],
+                               [KEYPOINTS_MEDIAN_GLOBAL[1], centroid[1]],
+                               [KEYPOINTS_MEDIAN_GLOBAL[2], centroid[2]],
+                               c='black', linestyle='--')
+                distance = np.linalg.norm(centroid[:2] - KEYPOINTS_MEDIAN_GLOBAL[:2])
+                ax_middle.text((KEYPOINTS_MEDIAN_GLOBAL[0] + centroid[0])/2, 
+                               (KEYPOINTS_MEDIAN_GLOBAL[1] + centroid[1])/2, 
+                               (KEYPOINTS_MEDIAN_GLOBAL[2] + centroid[2])/2, 
+                               f"{distance:.2f}m", color='black')
+            ax_middle.set_title(f"Track {track_id} with Distances to Keypoints Median")
+            ax_middle.set_xlabel('X (m)')
+            ax_middle.set_ylabel('Y (m)')
+            ax_middle.set_zlabel('Z (m)')
+            handles, labels_plot = ax_middle.get_legend_handles_labels()
+            unique = []
+            seen = set()
+            for h, l in zip(handles, labels_plot):
+                if l not in seen:
+                    unique.append((h, l))
+                    seen.add(l)
+            if unique:
+                ax_middle.legend(*zip(*unique), loc='upper right', bbox_to_anchor=(1.15, 1))
+
+            ax_bottom = axes_tracks[2]
+            all_track_points = np.vstack([point["points"] for point in track])
+            plot_with_enhanced_keypoints(ax_bottom, all_track_points, y_sample, edges=edges, 
+                                         title=f"Track {track_id} Overall Centroid")
+            overall_centroid = np.mean(all_track_points, axis=0)
+            ax_bottom.scatter(overall_centroid[0], overall_centroid[1], overall_centroid[2], 
+                              c='orange', marker='o', s=150, label='Overall Centroid')
+            ax_bottom.plot([KEYPOINTS_MEDIAN_GLOBAL[0], overall_centroid[0]], 
+                           [KEYPOINTS_MEDIAN_GLOBAL[1], overall_centroid[1]], 
+                           [KEYPOINTS_MEDIAN_GLOBAL[2], overall_centroid[2]], 
+                           c='black', linestyle='--')
+            distance_overall = np.linalg.norm(overall_centroid[:2] - KEYPOINTS_MEDIAN_GLOBAL[:2])
+            ax_bottom.text((KEYPOINTS_MEDIAN_GLOBAL[0] + overall_centroid[0])/2, 
+                           (KEYPOINTS_MEDIAN_GLOBAL[1] + overall_centroid[1])/2, 
+                           (KEYPOINTS_MEDIAN_GLOBAL[2] + overall_centroid[2])/2, 
+                           f"{distance_overall:.2f}m", color='black')
+            ax_bottom.set_title(f"Track {track_id} Overall Centroid Distance")
+            ax_bottom.set_xlabel('X (m)')
+            ax_bottom.set_ylabel('Y (m)')
+            ax_bottom.set_zlabel('Z (m)')
+            handles, labels_plot = ax_bottom.get_legend_handles_labels()
+            unique = []
+            seen = set()
+            for h, l in zip(handles, labels_plot):
+                if l not in seen and l != '':
+                    unique.append((h, l))
+                    seen.add(l)
+            if unique:
+                ax_bottom.legend(*zip(*unique), loc='upper right', bbox_to_anchor=(1.15, 1))
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            plt.show()
+
+    print(f"\nTotal number of tracks: {num_tracks}")
+    for track_id, track in tracks.items():
+        total_points = sum([len(p["points"]) for p in track])
+        frames_covered = [p["frame_idx"] +1 for p in track]
+        cluster_labels = []
+        for p in track:
+            frame_idx = p["frame_idx"]
+            centroid = p["centroid"]
+            label_found = None
+            for lbl, c in all_centroids[frame_idx].items():
+                if np.allclose(c, centroid, atol=1e-5):
+                    label_found = lbl
+                    break
+            cluster_labels.append(label_found)
+        print(f"\nTrack {track_id}:")
+        print(f"  Total Points: {total_points}")
+        print(f"  Frames Covered: {frames_covered}")
+        print(f"  Cluster Labels per Frame: {cluster_labels}")
+
+    print("\n=== Bayesian Optimization for Kalman Filter Hyperparams (Q,R,P) ===")
+    best_params = bayesian_optimize_kalman_params(tracks, max_frames=5, init_points=5, n_iter=15)
+    best_Q = best_params['q_val']
+    best_R = best_params['r_val']
+    best_P = best_params['p_val']
+
+    print("\n=== Applying Kalman Filter to Tracks with Best Hyperparams (via Bayesian Optimization) ===")
+    filtered_states, stabilization_steps = apply_kalman_filter_multi_frame_stabilize(
+        tracks, threshold=2, Q_val=best_Q, R_val=best_R, P_val=best_P
+    )
+    plot_kalman_state_changes_3d(filtered_states)
+    track_errors = evaluate_kalman_prediction_quality(tracks, filtered_states)
+
+    print("\n=== Evaluating Tracks to Select the Best Human Track ===")
+    best_tracks = evaluate_tracks_and_filter_out_others(tracks, filtered_states, stabilization_steps, track_errors)
+    if not best_tracks:
+        print("No valid track found.")
+        return
+
+    best_track_id, best_track = next(iter(best_tracks.items()))
+    print(f"\nSelected Best Track ID: {best_track_id}")
+    total_pts_in_best = sum(len(p['points']) for p in best_track)
+    print(f"Best track has {total_pts_in_best} points across frames.")
+
+    print("\n=== Distances of All Tracks' Overall Centroids to Keypoints Median ===")
+    for tid, tdata in tracks.items():
+        track_centroids = np.array([d['centroid'] for d in tdata])
+        if len(track_centroids) > 0:
+            overall_centroid = np.mean(track_centroids, axis=0)
+            dist_to_kp_median = np.linalg.norm(overall_centroid[:2] - keypoints_median[:2])
+            print(f"Track {tid} -> Dist={dist_to_kp_median:.4f}m (2D XY)")
+
+    print("\n=== Plotting the Best Track Alone ===")
+    fig_best = plt.figure(figsize=(12, 6))
+    fig_best.suptitle(f'Best Track {best_track_id} Visualization', fontsize=16, y=1.02)
+
+    ax1_best = fig_best.add_subplot(1, 2, 1, projection='3d')
+    ax1_best.scatter(stacked_data[:, 0], stacked_data[:, 1], stacked_data[:, 2],
+                     c='green', alpha=0.3, s=5, label='Original Points')
+    for point in best_track:
+        ax1_best.scatter(point['centroid'][0], point['centroid'][1], point['centroid'][2],
+                         c='red', s=50, label='Best Track Centroid')
+    ax1_best.set_title("Best Track with All Its Points")
+    ax1_best.set_xlabel('X (m)')
+    ax1_best.set_ylabel('Y (m)')
+    ax1_best.set_zlabel('Z (m)')
+    ax1_best.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+
+    ax2_best = fig_best.add_subplot(1, 2, 2, projection='3d')
+    plot_with_enhanced_keypoints(ax2_best, np.empty((0, 3)), y_sample, edges=edges,
+                                 title="Keypoints")
+    ax2_best.set_title("Keypoints")
+    ax2_best.set_xlabel('X (m)')
+    ax2_best.set_ylabel('Y (m)')
+    ax2_best.set_zlabel('Z (m)')
+    ax2_best.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+
+    plt.tight_layout()
+    plt.show()
+
+    print("\n=== Plotting Selected Best Track with Keypoints Mapping ===")
+    fig_selected = plt.figure(figsize=(12, 6))
+
+    ax_selected1 = fig_selected.add_subplot(1, 2, 1, projection='3d')
+    all_best_track_points = np.vstack([p['points'] for p in best_track])
+    ax_selected1.scatter(all_best_track_points[:, 0],
+                         all_best_track_points[:, 1],
+                         all_best_track_points[:, 2],
+                         c='blue', s=5, label='Best Track Points', alpha=0.5)
+    plot_with_enhanced_keypoints(ax_selected1, None, y_sample, edges=edges,
+                                 title="Selected Best Track Points with Keypoints")
+    ax_selected1.set_xlabel('X (m)')
+    ax_selected1.set_ylabel('Y (m)')
+    ax_selected1.set_zlabel('Z (m)')
+    ax_selected1.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+
+    ax_selected2 = fig_selected.add_subplot(1, 2, 2, projection='3d')
+    for point in best_track:
+        ax_selected2.scatter(point['points'][:, 0],
+                             point['points'][:, 1],
+                             point['points'][:, 2],
+                             c='red', s=5, label='Best Track Points')
+    plot_with_enhanced_keypoints(ax_selected2, np.empty((0, 3)), y_sample, edges=edges,
+                                 title="Best Track Points (No Centroids)")
+    ax_selected2.set_xlabel('X (m)')
+    ax_selected2.set_ylabel('Y (m)')
+    ax_selected2.set_zlabel('Z (m)')
+    ax_selected2.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+
+    plt.tight_layout()
+    plt.show()
+
+    print("\nDone processing sample index", sample_index)
+
+    if track_errors:
+        best_rmse_id = min(track_errors, key=track_errors.get)
+    else:
+        best_rmse_id = None
+
+    min_dist = float('inf')
+    best_distance_id = None
+    for track_id, track_data in tracks.items():
+        if len(track_data) > 0:
+            all_points = np.vstack([item['points'] for item in track_data])
+            overall_centroid = np.mean(all_points, axis=0)
+            distance = np.linalg.norm(overall_centroid[:2] - KEYPOINTS_MEDIAN_GLOBAL[:2]) if KEYPOINTS_MEDIAN_GLOBAL is not None else float('inf')
+            if distance < min_dist:
+                min_dist = distance
+                best_distance_id = track_id
+
+    combined_track = evaluate_tracks_and_filter_out_others(tracks, filtered_states, stabilization_steps, track_errors)
+    best_combined_id = list(combined_track.keys())[0] if combined_track else None
+
+    plot_three_best_tracks(
+        original_data=stacked_data,      
+        tracks=tracks,
+        best_tracks=best_tracks,
+        best_rmse_id=best_rmse_id,
+        best_distance_id=best_distance_id,
+        best_combined_id=best_combined_id,
+        y_sample=y_sample,
+        edges=edges
+    )
+    
+
+    plot_four_subplots(
+    original_data=stacked_data,      
+    cleaned_data=cleaned_data,       
+    dbscan_labels=dbscan_labels,
+    tracks=tracks,
+    best_track=best_track,
+    y_sample=y_sample,
+    edges=edges
+    )
+
+    
+       
+if __name__ == '__main__':
+    main()
