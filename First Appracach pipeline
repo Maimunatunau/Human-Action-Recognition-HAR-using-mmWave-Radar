@@ -11,22 +11,15 @@ from scipy.spatial.distance import cdist
 from scipy.optimize import linear_sum_assignment
 from filterpy.kalman import KalmanFilter
 
-# You need to install bayesian-optimization: pip install bayesian-optimization
 from bayes_opt import BayesianOptimization
 
 GLOBAL_TRACK_DISTANCES = {}
 KEYPOINTS_MEDIAN_GLOBAL = None
 
 def remove_null_placeholders_after_shift(frame, new_origin, threshold=0.01):
-    """
-    Removes points close to the new origin after shifting.
-    """
     return frame[np.linalg.norm(frame - new_origin, axis=1) > threshold]
 
 def split_data_into_frames(stacked_data, n_frames=5):
-    """
-    Splits data (N,3) into n_frames segments.
-    """
     frames = []
     total_points = len(stacked_data)
     frame_size = total_points // n_frames
@@ -47,10 +40,6 @@ def get_subplot_grid(n_plots, max_cols=5):
     return rows, cols
 
 def plot_with_enhanced_keypoints(ax, data, keypoints, edges=None, title=None):
-    """
-    Plots the point cloud (data) plus keypoints (if non-empty).
-    Optionally connect keypoints with edges (a skeleton).
-    """
     if data is not None and len(data) > 0:
         ax.scatter(data[:, 0], data[:, 1], data[:, 2],
                    c='green', alpha=0.8, s=5, label='Point Cloud')
@@ -74,8 +63,6 @@ def plot_with_enhanced_keypoints(ax, data, keypoints, edges=None, title=None):
     ax.set_ylabel('Y (m)', labelpad=10)
     ax.set_zlabel('Z (m)', labelpad=10)
     ax.grid(True)
-
-    # Unique legend
     handles, labels = ax.get_legend_handles_labels()
     unique = []
     seen = set()
@@ -87,9 +74,6 @@ def plot_with_enhanced_keypoints(ax, data, keypoints, edges=None, title=None):
         ax.legend(*zip(*unique), loc='upper right', bbox_to_anchor=(1.15, 1))
 
 def plot_original_dataset(data):
-    """
-    3D scatter to visualize the original data.
-    """
     fig = plt.figure(figsize=(10, 6))
     ax = fig.add_subplot(111, projection='3d')
     ax.scatter(data[:, 0], data[:, 1], data[:, 2],
@@ -103,9 +87,6 @@ def plot_original_dataset(data):
     plt.show()
 
 def apply_dbscan(points, eps=0.4, min_samples=4, xy_weight=1.0, z_weight=0.25):
-    """
-    DBSCAN with weighting in x,y vs z.
-    """
     weighted_data = points.copy()
     weighted_data[:, :2] *= xy_weight
     weighted_data[:, 2] *= z_weight
@@ -113,9 +94,6 @@ def apply_dbscan(points, eps=0.4, min_samples=4, xy_weight=1.0, z_weight=0.25):
     return clustering.labels_
 
 def calculate_centroids(frame, labels):
-    """
-    Return {label -> (x,y,z)} for each cluster, excluding noise label = -1.
-    """
     centroids = {}
     unique_labels = np.unique(labels)
     for lbl in unique_labels:
@@ -140,13 +118,10 @@ def calculate_and_plot_cost_matrix(centroidsA, centroidsB, title_suffix=""):
     ax.set_ylabel('Centroids A')
     row_inds, col_inds = linear_sum_assignment(cost_matrix)
 
-    # Red box around matched pairs
     for r, c in zip(row_inds, col_inds):
         rect = plt.Rectangle((c - 0.5, r - 0.5), 1, 1,
                              fill=False, edgecolor='red', linewidth=2)
         ax.add_patch(rect)
-
-    # Cost text
     for i in range(cost_matrix.shape[0]):
         for j in range(cost_matrix.shape[1]):
             ax.text(
@@ -236,9 +211,6 @@ def build_tracks_across_frames(all_centroids, all_labels, all_clean_frames):
     return tracks
 
 def bayesian_optimize_kalman_params(tracks, max_frames=5, init_points=5, n_iter=25):
-    """
-    Bayesian optimization for Kalman Filter hyperparameters (Q, R, P).
-    """
     from bayes_opt import BayesianOptimization
 
     def test_kalman_params(q_val, r_val, p_val):
@@ -382,22 +354,14 @@ def plot_kalman_state_changes_3d(filtered_states):
             x_vals = [s[0] for s in states]
             y_vals = [s[1] for s in states]
             z_vals = [0 for _ in states]
-            
-            # Assign a unique color to each track
             color = colors[idx % len(colors)]
-            
-            # Plot the track points
             ax.plot(x_vals, y_vals, z_vals, marker='o', color=color, label=f"Track {track_id}")
-            
-            # Plot arrows between consecutive states with the same color and thinner linewidth
             for i in range(len(states) - 1):
                 start_x, start_y, start_z = x_vals[i], y_vals[i], z_vals[i]
                 end_x, end_y, end_z = x_vals[i+1], y_vals[i+1], z_vals[i+1]
                 dx = end_x - start_x
                 dy = end_y - start_y
                 dz = end_z - start_z
-                
-                # Use the same color for arrows and set a thinner linewidth
                 ax.quiver(start_x, start_y, start_z, dx, dy, dz,
                           color=color, arrow_length_ratio=0.1, linewidth=0.5)
         else:
@@ -408,8 +372,6 @@ def plot_kalman_state_changes_3d(filtered_states):
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
     ax.set_title('Kalman Filter State Changes (3D Plot)')
-    
-    # Handle duplicate labels in the legend
     handles, labels = ax.get_legend_handles_labels()
     unique = list(dict(zip(labels, handles)).items())
     if unique:
@@ -418,27 +380,7 @@ def plot_kalman_state_changes_3d(filtered_states):
     plt.tight_layout()
     plt.show()
 
-
-
-import numpy as np
-import matplotlib.pyplot as plt
-
 def evaluate_kalman_prediction_quality(tracks, filtered_states):
-    """
-    Evaluates how well the Kalman Filter predictions match the actual cluster centroids
-    using RMSE and plots all track errors on a single plot with different colors and labels.
-    
-    Parameters:
-    - tracks: dict
-        A dictionary where each key is a track ID and the value is a list of dictionaries
-        containing 'frame_idx' and 'centroid' for each frame.
-    - filtered_states: dict
-        A dictionary where each key is a track ID and the value is a list of filtered state vectors.
-    
-    Returns:
-    - track_errors: dict
-        A dictionary containing RMSE for each track.
-    """
     print("\n=== Kalman Prediction Quality (RMSE) ===")
     track_errors = {}
     all_errors = {}
@@ -480,31 +422,12 @@ def evaluate_kalman_prediction_quality(tracks, filtered_states):
 
     return track_errors
 
-
-import numpy as np
-
 def evaluate_tracks_and_filter_out_others(tracks, filtered_states, stabilization_steps, track_errors):
-    """
-    Evaluates all tracks based on RMSE and distance to keypoints median, then selects the best track.
-    If the best track based on RMSE and distance are the same, it selects that track alone.
-    Otherwise, it combines the two best tracks without duplicating frames.
-    
-    Parameters:
-    - tracks (dict): Dictionary of tracks with track IDs as keys and track data as values.
-    - filtered_states (dict): Dictionary of filtered states with track IDs as keys and state lists as values.
-    - stabilization_steps (int): Number of steps required for stabilization (not used in current logic).
-    - track_errors (dict): Dictionary to store RMSE errors for each track.
-    
-    Returns:
-    - best_tracks (dict): Dictionary containing the selected best track.
-    """
     if not filtered_states:
         print("No tracks to evaluate.")
         return {}
     
     global KEYPOINTS_MEDIAN_GLOBAL  # Ensure this global variable is defined elsewhere in your code
-
-    # Find best track based solely on RMSE
     best_rmse_id = None
     lowest_rmse = float('inf')
     track_rmse_values = {}  # To store RMSE for each track
@@ -521,8 +444,6 @@ def evaluate_tracks_and_filter_out_others(tracks, filtered_states, stabilization
         if rmse < lowest_rmse:
             lowest_rmse = rmse
             best_rmse_id = track_id
-
-    # Find best track based solely on distance to keypoints median
     best_distance_id = None
     lowest_distance = float('inf')
     for track_id, track_data in tracks.items():
@@ -537,22 +458,16 @@ def evaluate_tracks_and_filter_out_others(tracks, filtered_states, stabilization
 
     print(f"\nBest Track ID based on RMSE: {best_rmse_id} with RMSE={lowest_rmse:.4f}")
     print(f"Best Track ID based on Distance: {best_distance_id} with distance={lowest_distance:.4f}")
-
-    # Initialize the best_tracks dictionary
     best_tracks = {}
-
-    # Check if both criteria point to the same track
     if best_rmse_id == best_distance_id and best_rmse_id is not None:
         print(f"\nBoth RMSE and Distance criteria select the same Track ID: {best_rmse_id}. Selecting this track exclusively.")
         best_tracks[best_rmse_id] = tracks[best_rmse_id]
     else:
-        # Combine the two best tracks if they are different
         if best_rmse_id is not None and best_distance_id is not None:
             best_rmse_track = tracks[best_rmse_id]
             best_distance_track = tracks[best_distance_id]
             combined_track = best_rmse_track.copy()
             for item in best_distance_track:
-                # Avoid adding duplicate frames based on frame_idx
                 if not any(existing['frame_idx'] == item['frame_idx'] for existing in combined_track):
                     combined_track.append(item)
 
@@ -572,8 +487,6 @@ def plot_all_tracks_across_stages(y_sample, all_tracks, edges=None):
     else:
         keypoints = y_sample
     median_point = np.median(keypoints, axis=0)
-
-    # Precompute overall centroid distances for each track
     track_distances = {}
     for track_id, track_data in all_tracks.items():
         track_centroids = np.array([d['centroid'] for d in track_data])
@@ -647,20 +560,14 @@ def plot_three_best_tracks(tracks, best_rmse_id, best_distance_id, best_combined
             ax.set_title(f"{title}\nNo Points in Track")
             continue
 
-        # Plot all points
         ax.scatter(all_track_points[:, 0], all_track_points[:, 1], all_track_points[:, 2],
                    c='blue', s=5, label='Track Points', alpha=0.5)
 
-        # Calculate additional metrics: distance and coverage
         overall_centroid = np.mean(all_track_points, axis=0)
         distance = (np.linalg.norm(overall_centroid[:2] - KEYPOINTS_MEDIAN_GLOBAL[:2])
                     if KEYPOINTS_MEDIAN_GLOBAL is not None else float('inf'))
         coverage = len(all_track_points)
-
-        # Update title with distance and coverage info
         title += f"\nDistance: {distance:.2f}m, Points: {coverage}"
-
-        # Plot keypoints and edges
         plot_with_enhanced_keypoints(ax, None, y_sample, edges=edges, title=title)
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
@@ -681,18 +588,6 @@ def plot_four_subplots(
     y_sample, 
     edges
 ):
-    """
-    Plots four subplots:
-      1) Original (full) Point Cloud
-      2) Biggest DBSCAN Cluster (from cleaned_data)
-      3) Biggest Track
-      4) Best Human Cluster with Stretch & Padding
-    Additionally, adds annotations for cluster IDs and track IDs.
-    """
-    
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
 
     # -- SUBPLOT 1: Plot the original (full) data as-is
     fig = plt.figure(figsize=(20, 15))
@@ -860,8 +755,6 @@ def main():
     shift_vector = np.zeros(3)
     new_origin = shift_vector
 
-    # We do NOT do any shifting here. The rest remains unchanged.
-
     print("\n=== Plotting Original Point Cloud and Keypoints ===")
     fig = plt.figure(figsize=(14, 6))
     ax1 = fig.add_subplot(1, 2, 1, projection='3d')
@@ -942,8 +835,6 @@ def main():
                 ax.legend(*zip(*unique), loc='upper right', bbox_to_anchor=(1.15, 1))
     plt.tight_layout()
     plt.show()
-
-    # Use new_origin (which is just [0,0,0]) so remove_null_placeholders_after_shift won't break
     frames_after_cleaning = []
     print("\nPoints per segment after null removal:")
     for i, frame in enumerate(frames_before_cleaning):
@@ -1019,7 +910,6 @@ def main():
             cluster_counts[lbl] = count
             print(f"  Cluster {lbl}: {count} points")
         cluster_info.append(cluster_counts)
-    # Ensure that the concatenated labels match the number of cleaned points
     all_labels = np.concatenate(dbscan_labels)
     assert len(all_labels) == len(cleaned_data), "Mismatch between cleaned data points and DBSCAN labels."
 
@@ -1321,15 +1211,11 @@ def main():
 
     print("\nDone processing sample index", sample_index)
 
-    # track_errors = evaluate_kalman_prediction_quality(tracks, filtered_states)
-
-    # Compute best track ID based on RMSE alone
     if track_errors:
         best_rmse_id = min(track_errors, key=track_errors.get)
     else:
         best_rmse_id = None
 
-    # Compute best track ID based on distance to keypoints' median
     min_dist = float('inf')
     best_distance_id = None
     for track_id, track_data in tracks.items():
@@ -1341,17 +1227,14 @@ def main():
                 min_dist = distance
                 best_distance_id = track_id
 
-    # Compute best track based on combined RMSE + distance
     combined_track = evaluate_tracks_and_filter_out_others(tracks, filtered_states, stabilization_steps, track_errors)
     best_combined_id = list(combined_track.keys())[0] if combined_track else None
-
-    # Plot the three best tracks side by side
     plot_three_best_tracks(tracks, best_rmse_id, best_distance_id, best_combined_id, y_sample, edges=edges)
 
        
     plot_four_subplots(
-    original_data=stacked_data,      # e.g. shape=(1100, 3)
-    cleaned_data=cleaned_data,       # e.g. shape=(312, 3), matches len(dbscan_labels)
+    original_data=stacked_data,      
+    cleaned_data=cleaned_data,      
     dbscan_labels=dbscan_labels,
     tracks=tracks,
     best_track=best_track,
